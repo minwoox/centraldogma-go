@@ -390,9 +390,15 @@ func (c *Client) Push(ctx context.Context, projectName, repoName, baseRevision s
 // WatchFile awaits and returns the query result of the specified file since the specified last known revision.
 func (c *Client) WatchFile(ctx context.Context, projectName, repoName, lastKnownRevision string,
 	query *Query, timeout time.Duration) <-chan *WatchResult {
-	watchResult := make(chan *WatchResult)
+	watchResult := make(chan *WatchResult, 1)
 	go func() {
-		watchResult <- c.watch.watchFile(ctx, projectName, repoName, lastKnownRevision, query, timeout)
+		//watchResult <- c.watch.watchFile(ctx, projectName, repoName, lastKnownRevision, query, timeout)
+		fw, err := c.watch.fileWatcher(projectName, repoName, query)
+		if err != nil {
+			watchResult <- &WatchResult{Err: err}
+			return
+		}
+		fw.start(ctx, watchResult)
 	}()
 	return watchResult
 }
@@ -400,7 +406,7 @@ func (c *Client) WatchFile(ctx context.Context, projectName, repoName, lastKnown
 // WatchRepository awaits and returns the latest known revision since the specified revision.
 func (c *Client) WatchRepository(ctx context.Context,
 	projectName, repoName, lastKnownRevision, pathPattern string, timeout time.Duration) <-chan *WatchResult {
-	watchResult := make(chan *WatchResult)
+	watchResult := make(chan *WatchResult, 1)
 	go func() {
 		watchResult <- c.watch.watchRepo(ctx, projectName, repoName, lastKnownRevision,
 			pathPattern, timeout)
@@ -419,14 +425,14 @@ func (c *Client) WatchRepository(ctx context.Context,
 //        myCh <- value
 //    })
 //    myValue := <-myCh
-func (c *Client) FileWatcher(projectName, repoName string, query *Query) (*Watcher, error) {
-	fw, err := c.watch.fileWatcher(projectName, repoName, query)
-	if err != nil {
-		return nil, err
-	}
-	fw.start()
-	return fw, nil
-}
+//func (c *Client) FileWatcher(projectName, repoName string, query *Query) (*Watcher, error) {
+//	fw, err := c.watch.fileWatcher(projectName, repoName, query)
+//	if err != nil {
+//		return nil, err
+//	}
+//	fw.start()
+//	return fw, nil
+//}
 
 //RepoWatcher returns a Watcher which notifies its listeners when the repository that matched the given
 //pathPattern becomes available or changes. For example:

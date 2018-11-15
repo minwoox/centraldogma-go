@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,16 +43,13 @@ type commitWithEntry struct {
 }
 
 func (ws *watchService) watchFile(ctx context.Context, projectName, repoName, lastKnownRevision string,
-	query *Query, timeout time.Duration) *WatchResult {
-	if query == nil {
-		return &WatchResult{Err: errors.New("query should not be nil")}
-	}
+	query *Query, timeout time.Duration, watchResult <-chan *WatchResult) error {
 
 	u := fmt.Sprintf("%vprojects/%v/repos/%v/contents%v", defaultPathPrefix, projectName, repoName, query.Path)
 	v := &url.Values{}
 	if query != nil && query.Type == JSONPath {
 		if err := setJSONPaths(v, query.Path, query.Expressions); err != nil {
-			return &WatchResult{Err: err}
+			return err
 		}
 	}
 	u += encodeValues(v)
@@ -71,11 +67,11 @@ func (ws *watchService) watchRepo(ctx context.Context, projectName, repoName,
 	return ws.watchRequest(ctx, u, lastKnownRevision, timeout)
 }
 
-func (ws *watchService) watchRequest(
-	ctx context.Context, u, lastKnownRevision string, timeout time.Duration) *WatchResult {
+func (ws *watchService) watchRequest(ctx context.Context, u, lastKnownRevision string,
+	timeout time.Duration, watchResult <-chan *WatchResult) error {
 	req, err := ws.client.newRequest(http.MethodGet, u, nil)
 	if err != nil {
-		return &WatchResult{Err: err}
+		return err
 	}
 	if len(lastKnownRevision) != 0 {
 		req.Header.Set("if-none-match", lastKnownRevision)
@@ -89,9 +85,16 @@ func (ws *watchService) watchRequest(
 	commitWithEntry := new(commitWithEntry)
 	res, err := ws.client.do(ctx, req, commitWithEntry)
 	if err != nil {
-		return &WatchResult{Res: res, Err: err}
+		if err == context.Canceled {
+			// The user wants to cancel watching operation so just return the err.
+			return err
+		}
+
+		watchResult <- &WatchResult{Res: res, Err: err}
+		return nil
 	} else {
-		return &WatchResult{Commit: commitWithEntry.Commit, Entry: commitWithEntry.Entry, Res: res, Err: nil}
+		watchResult <- &WatchResult{Commit: commitWithEntry.Commit, Entry: commitWithEntry.Entry, Res: res, Err: nil}
+		return nil
 	}
 }
 
@@ -106,6 +109,8 @@ const (
 
 // Watcher watches the changes of a repository or a file.
 type Watcher struct {
+
+	numAttemptsSoFar    int
 	state               int32
 	initialValueCh      chan *Latest // channel whose buffer is 1.
 	isInitialValueChSet int32        // 0 is false, 1 is true
@@ -115,12 +120,15 @@ type Watcher struct {
 	updateListeners     []func(revision int, value interface{})
 	listenersMutex      *sync.Mutex
 
-	doWatchFunc          func(lastKnownRevision int) *WatchResult
+	doWatchFunc          func(context.Context, int, watchResult <-chan *WatchResult) error
 	convertingResultFunc func(result *WatchResult) *Latest
 
-	projectName string
-	repoName    string
-	pathPattern string
+	projectName  string
+	repoName     string
+	pathPattern  string
+	absolutePath string
+
+	client *Client
 }
 
 // Latest represents a holder of the latest known value and its Revision retrieved by Watcher.
@@ -130,14 +138,17 @@ type Latest struct {
 	Err      error
 }
 
-func newWatcher(projectName, repoName, pathPattern string) *Watcher {
+func newWatcher(client *Client, projectName, repoName, pathPattern, absolutePath string) *Watcher {
 	rand.Seed(time.Now().UTC().UnixNano())
-	watchCTX, watchCancelFunc := context.WithCancel(context.Background())
-	return &Watcher{state: initial, initialValueCh: make(chan *Latest, 1),
-		watchCTX: watchCTX, watchCancelFunc: watchCancelFunc,
+	return &Watcher{
+		client: client,
+		state: initial,
+		initialValueCh: make(chan *Latest, 1),
 		listenersMutex: &sync.Mutex{},
 		projectName:    projectName,
-		repoName:       repoName, pathPattern: pathPattern}
+		repoName:       repoName,
+		pathPattern:    pathPattern,
+		absolutePath:   absolutePath}
 }
 
 // AwaitInitialValue awaits for the initial value to be available.
@@ -229,11 +240,15 @@ func (ws *watchService) fileWatcher(projectName, repoName string, query *Query) 
 		return nil, errors.New("query should not be nil")
 	}
 
-	w := newWatcher(projectName, repoName, query.Path)
-	w.doWatchFunc = func(lastKnownRevision int) *WatchResult {
-		return ws.watchFile(w.watchCTX, projectName, repoName, strconv.Itoa(lastKnownRevision),
-			query, watchTimeout)
+	u := fmt.Sprintf("%vprojects/%v/repos/%v/contents%v", defaultPathPrefix, projectName, repoName, query.Path)
+	v := &url.Values{}
+	if query != nil && query.Type == JSONPath {
+		if err := setJSONPaths(v, query.Path, query.Expressions); err != nil {
+			return nil, err
+		}
 	}
+	u += encodeValues(v)
+	w := newWatcher(ws.client, projectName, repoName, query.Path, u)
 	w.convertingResultFunc = func(result *WatchResult) *Latest {
 		value := result.Entry.Content
 		return &Latest{Revision: result.Commit.Revision, Value: value}
@@ -242,7 +257,14 @@ func (ws *watchService) fileWatcher(projectName, repoName string, query *Query) 
 }
 
 func (ws *watchService) repoWatcher(projectName, repoName, pathPattern string) (*Watcher, error) {
-	w := newWatcher(projectName, repoName, pathPattern)
+	if len(pathPattern) != 0 && !strings.HasPrefix(pathPattern, "/") {
+		// Normalize the pathPattern when it does not start with "/" so that the pathPattern fits into the url.
+		pathPattern = "/**/" + pathPattern
+	}
+
+	u := fmt.Sprintf("%vprojects/%v/repos/%v/contents%v", defaultPathPrefix, projectName, repoName, pathPattern)
+	w := newWatcher(ws.client, projectName, repoName, pathPattern, u)
+
 	w.doWatchFunc = func(lastKnownRevision int) *WatchResult {
 		return ws.watchRepo(w.watchCTX, projectName, repoName, strconv.Itoa(lastKnownRevision),
 			pathPattern, watchTimeout)
@@ -254,48 +276,33 @@ func (ws *watchService) repoWatcher(projectName, repoName, pathPattern string) (
 	return w, nil
 }
 
-func (w *Watcher) start() {
-	if atomic.CompareAndSwapInt32(&w.state, initial, started) {
-		go func() {
-			w.scheduleWatch(0)
-		}()
-	}
-}
+func (w *Watcher) start(ctx context.Context, watchResult <-chan *WatchResult) {
+	w.numAttemptsSoFar = 0
 
-func (w *Watcher) scheduleWatch(numAttemptsSoFar int) {
-	if w.isStopped() {
-		return
-	}
-
-	var delay time.Duration
-	if numAttemptsSoFar == 0 {
-		latest := w.Latest()
-		if latest.Err != nil {
-			delay = delayOnSuccess
+	for {
+		var delay time.Duration
+		if w.numAttemptsSoFar == 0 {
+			latest := w.Latest()
+			if latest.Err != nil {
+				delay = delayOnSuccess
+			} else {
+				delay = 0
+			}
 		} else {
-			delay = 0
+			delay = nextDelay(w.numAttemptsSoFar)
 		}
-	} else {
-		delay = nextDelay(numAttemptsSoFar)
-	}
-
-	select {
-	case <-w.watchCTX.Done():
-	case <-time.NewTimer(delay).C:
-		w.doWatch(numAttemptsSoFar)
+		select {
+		case <-ctx:
+		case <-time.NewTimer(delay).C:
+			if !w.doWatch(ctx, watchResult) {
+				// Stop watching.
+				return
+			}
+		}
 	}
 }
 
-func (w *Watcher) isStopped() bool {
-	state := atomic.LoadInt32(&w.state)
-	return state == stopped
-}
-
-func (w *Watcher) doWatch(numAttemptsSoFar int) {
-	if w.isStopped() {
-		return
-	}
-
+func (w *Watcher) doWatch(ctx context.Context, watchResult <-chan *WatchResult) bool {
 	var lastKnownRevision int
 	curLatest := w.Latest()
 	if curLatest.Revision == 0 {
@@ -304,17 +311,29 @@ func (w *Watcher) doWatch(numAttemptsSoFar int) {
 		lastKnownRevision = curLatest.Revision
 	}
 
-	watchResult := w.doWatchFunc(lastKnownRevision)
-	if watchResult.Err != nil {
-		if watchResult.Err == context.Canceled {
-			// Cancelled by close()
-			return
+	req, err := w.newRequest(strconv.Itoa(lastKnownRevision), watchTimeout)
+	if err != nil {
+		// Stop watching because an error is raise while making a request.
+		watchResult <- &WatchResult{Err: nil}
+		return false;
+	}
+
+	commitWithEntry := new(commitWithEntry)
+	res, err := ws.client.do(ctx, req, commitWithEntry)
+	if err != nil {
+		if err == context.Canceled {
+			// The user wants to cancel watching operation.
+			watchResult <- &WatchResult{Err: nil}
+			return false;
 		}
 
-		log.Debug(watchResult.Err)
-		w.scheduleWatch(numAttemptsSoFar + 1)
-		return
+		watchResult <- &WatchResult{Res: res, Err: err}
+		w.numAttemptsSoFar++
+		return true
 	}
+
+	watchResult <- &WatchResult{
+		Commit: commitWithEntry.Commit, Entry: commitWithEntry.Entry, Res: res, Err: nil}
 
 	newLatest := w.convertingResultFunc(watchResult)
 	if w.isInitialValueChSet == 0 && atomic.CompareAndSwapInt32(&w.isInitialValueChSet, 0, 1) {
@@ -325,7 +344,23 @@ func (w *Watcher) doWatch(numAttemptsSoFar int) {
 	log.Debugf("Watcher noticed updated file: %s/%s%s, rev=%v",
 		w.projectName, w.repoName, w.pathPattern, newLatest.Revision)
 	w.notifyListeners()
-	w.scheduleWatch(0)
+	w.numAttemptsSoFar = 0
+}
+
+func (w *Watcher) newRequest(lastKnownRevision string, timeout time.Duration) (*http.Request, error) {
+	req, err := w.client.newRequest(http.MethodGet, w.uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(lastKnownRevision) != 0 {
+		req.Header.Set("if-none-match", lastKnownRevision)
+	} else {
+		req.Header.Set("if-none-match", "-1")
+	}
+	if timeout != 0 {
+		req.Header.Set("prefer", fmt.Sprintf("wait=%v", timeout.Seconds()))
+	}
+	return req, nil
 }
 
 func (w *Watcher) notifyListeners() {
